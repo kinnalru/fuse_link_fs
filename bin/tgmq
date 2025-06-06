@@ -49,6 +49,7 @@ end
 @args = parser.parse!
 
 TgMq.configure do |config|
+  config.logger = ActiveSupport::TaggedLogging.new(::Logger.new(STDERR, formatter: Logger::Formatter.new))
   config.logger.level = @opts[:log_level]
 end
 
@@ -56,8 +57,11 @@ $conn = conn = TgMq::Connection.new(itoken: @opts[:itoken], otoken: @opts[:otoke
 
 control_queue = $queue = queue = SizedQueue.new(50)
 
-def terminate_now
+def terminate_now(msq = 'Quitting')
+  return if $terminate
+
   $terminate = true
+  warn("#{msq} gracefully...")
   STDOUT.flush
   STDIN.close
   $conn.stop
@@ -65,25 +69,21 @@ def terminate_now
 end
 
 Signal.trap 'TERM' do
-  $terminate = true
   Thread.new do
-    warn('Terminating gracefully...')
-    terminate_now
+    terminate_now('Terminating')
   end
 end
 
 Signal.trap 'INT' do
-  $terminate = true
   Thread.new do
-    warn('Stopping gracefully...')
-    terminate_now
+    terminate_now('Stopping')
   end
 end
 
 reader = Thread.new(control_queue) do |q, _c|
   STDIN.binmode
   loop do
-    q.push([:in, STDIN.readpartial(3000)])
+    q.push([:in, STDIN.readpartial(3057)])
   rescue EOFError
     q.push([:in, 'EOF', proc { q.push(:terminate) }])
     break
@@ -94,9 +94,7 @@ end
 
 remote = Thread.new(queue, conn) do |q, c|
   STDOUT.binmode
-  c.subscribe do |line|
-    q.push([:out, line])
-  end
+  c.subscribe! { |line| q.push([:out, line]) }
 end
 
 loop do

@@ -20,9 +20,14 @@ module TgMq
       @queue.deq(*args, **kwargs)
     end
 
+    def stop
+      @queue.clear
+    end
+
     protected
 
     def next_seq!
+      @seq = 0 if @seq >= 10_000
       @seq += 1
     end
 

@@ -23,15 +23,16 @@ module TgMq
       @input_shaper = InputShaper.new(logger: logger)
 
       # Telegram Bot api alows 30 rps, we use only 20
-      @delay = 60.0 / 25.0
+      @delay = 60.0 / 29.0
       $r = 0
 
-      # @squeue = SizedQueue.new(10)
       @threads = []
       @threads << start_sender(@output_shaper, @output_bot, @delay)
     end
 
     def enqueue_message(data, &cb)
+      raise 'Unable to enqueue message: connection is stopped' if stopped?
+
       logger.debug("Enqueue message of #{data.size} bytes")
       @output_shaper.enqueue_data(data, &cb)
     end
@@ -46,6 +47,7 @@ module TgMq
       @stopped = true
       @output_bot.stop
       @input_bot.stop
+      @output_shaper.stop
 
       if wait_for_termination(timeout)
         true
@@ -63,11 +65,20 @@ module TgMq
       end
     end
 
-    def subscribe(&block)
+    def receive!
+      raise 'Unable to receive message: connection is stopped' if stopped?
+
+      subscribe do |line|
+        return line
+      end
+    end
+
+    def subscribe!(&block)
+      raise 'Unable to subscribe: connection is stopped' if stopped?
+
       @input_bot.listen do |message|
         case message
         when Telegram::Bot::Types::Message
-          logger.debug(123_123)
           text = (message&.new_chat_title || message&.text || message&.pinned_message&.text).to_s
           logger.debug "Receive raw: [#{text.first(15)}...] of #{text.size} bytes"
 
@@ -94,9 +105,18 @@ module TgMq
 
           logger.debug "Sending frame [#{frame.id}] of #{frame.data.size} bytes..."
 
-          response = tgretry { b.api.sendMessage(chat_id: @channel, text: frame.data) }
+          response = tgretry do
+            b.api.sendMessage(chat_id: @channel, text: "```\n#{frame.data}\n```",
+                              disable_notification: true,
+                              protect_content: true, parse_mode: 'markdown')
+          end
+
+          raise 'Unable to send message' unless response&.message_id
+
           sleep 0.1
-          pin_response = tgretry { b.api.pinChatMessage(chat_id: @channel, message_id: response.message_id) }
+          pin_response = tgretry do
+            b.api.pinChatMessage(chat_id: @channel, message_id: response.message_id, disable_notification: true)
+          end
 
           begin
             frame.callback&.call(pin_response)
@@ -106,6 +126,9 @@ module TgMq
 
           next_send_at = Time.now + delay * 2
         end
+      rescue StandardError => e
+        logger.error e.inspect
+        raise
       end
     end
 
@@ -113,8 +136,8 @@ module TgMq
       yield
     rescue Telegram::Bot::Exceptions::ResponseError => e
       if e.error_code.to_i == 429
-        logger.warn 'Retry packet send in 5 seconds...'
-        sleep 5
+        logger.warn "Retry packet send in #{@delay} seconds..."
+        sleep @delay
         retry
       end
     end

@@ -4,6 +4,7 @@ require 'active_support/all'
 require 'zeitwerk'
 
 loader = Zeitwerk::Loader.for_gem
+loader.ignore("#{__dir__}/tg-mq.rb")
 loader.inflector.inflect(
   'tg_mq' => 'TgMq',
   'tg-mq' => 'TgMq'

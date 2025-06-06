@@ -16,6 +16,7 @@ Gem::Specification.new do |spec|
   spec.files         = Dir['bin/*', 'lib/**/*', 'Gemfile*', 'LICENSE.txt', 'README.md']
   spec.bindir        = 'bin'
   spec.require_paths = ['lib']
+  spec.executables   = ['tgmq']
 
   spec.add_runtime_dependency 'activesupport', '~> 6.0'
   spec.add_runtime_dependency 'logger'

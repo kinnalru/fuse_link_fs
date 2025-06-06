@@ -4,7 +4,7 @@ module TgMq
   class Configuration
     attr_accessor :logger
 
-    def initialize(logger = ::Logger.new(STDERR, formatter: Logger::Formatter.new))
+    def initialize(logger = ::Logger.new(STDOUT, formatter: Logger::Formatter.new))
       @logger = logger.respond_to?(:tagged) ? logger : ActiveSupport::TaggedLogging.new(logger)
     end
 
