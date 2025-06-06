@@ -1,0 +1,123 @@
+#!/bin/env ruby
+
+require 'optparse'
+require 'tg_mq'
+
+UTIL = File.basename(__FILE__)
+SELF = File.absolute_path(__FILE__)
+
+Thread.abort_on_exception = true
+
+[STDIN, STDOUT, STDERR].each do |io|
+  io.sync = true
+rescue StandardError
+end
+
+@opts = {
+  itoken: nil,
+  otoken: nil,
+  channel: nil,
+  log_level: ENV.fetch('LOG_LEVEL', ::Logger::INFO)
+}
+
+parser = OptionParser.new do |o|
+  o.banner = "Usage: #{UTIL} [options]"
+
+  o.separator ''
+  o.separator 'TgMq options:'
+
+  o.on('-d', '--debug', 'Enable debug output. Overrides LOG_LEVEL environment variable') do
+    @opts[:log_level] = ::Logger::DEBUG
+  end
+
+  o.on('-s', '--silent', 'Disable info output. Overrides LOG_LEVEL environment variable') do
+    @opts[:log_level] = ::Logger::WARN
+  end
+
+  o.on('-i TOKEN', '--itoken TOKEN', String, 'Telegram Bot token for input channel') do |token|
+    @opts[:itoken] = token.strip
+  end
+
+  o.on('-o TOKEN', '--otoken TOKEN', String, 'Telegram Bot token for output channel') do |token|
+    @opts[:otoken] = token.strip
+  end
+
+  o.on('-c CHANNEL', '--channel CHANNEL', String, 'Telegram Bot chat_id to communicate through') do |channel|
+    @opts[:channel] = channel
+  end
+end
+@args = parser.parse!
+
+TgMq.configure do |config|
+  config.logger.level = @opts[:log_level]
+end
+
+$conn = conn = TgMq::Connection.new(itoken: @opts[:itoken], otoken: @opts[:otoken], channel: @opts[:channel])
+
+control_queue = $queue = queue = SizedQueue.new(50)
+
+def terminate_now
+  $terminate = true
+  STDOUT.flush
+  STDIN.close
+  $conn.stop
+  $queue.push(:terminate)
+end
+
+Signal.trap 'TERM' do
+  $terminate = true
+  Thread.new do
+    warn('Terminating gracefully...')
+    terminate_now
+  end
+end
+
+Signal.trap 'INT' do
+  $terminate = true
+  Thread.new do
+    warn('Stopping gracefully...')
+    terminate_now
+  end
+end
+
+reader = Thread.new(control_queue) do |q, _c|
+  STDIN.binmode
+  loop do
+    q.push([:in, STDIN.readpartial(3000)])
+  rescue EOFError
+    q.push([:in, 'EOF', proc { q.push(:terminate) }])
+    break
+  end
+rescue StandardError
+  q.push(:terminate)
+end
+
+remote = Thread.new(queue, conn) do |q, c|
+  STDOUT.binmode
+  c.subscribe do |line|
+    q.push([:out, line])
+  end
+end
+
+loop do
+  cmd, data, cb = queue.deq(timeout: 1)
+  if cmd == :terminate || $terminate
+    terminate_now
+    break
+  end
+
+  next if cmd.nil?
+
+  if cmd == :in
+    cb ? conn.enqueue_message(data, &cb) : conn.enqueue_message(data)
+  elsif cmd == :out
+    if data.strip == 'EOF'
+      terminate_now
+    else
+      STDOUT.write(data)
+      STDOUT.flush
+    end
+  end
+end
+
+[reader, remote].each(&:join)
