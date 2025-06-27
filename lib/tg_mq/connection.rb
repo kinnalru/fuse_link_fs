@@ -7,6 +7,48 @@ module TgMq
   class Connection
     attr_reader :logger
 
+    # curl -X POST -H 'Content-Type: application/json' -d '{"chat_id": "-1002782239054", "text": "This is a test from curl", "disable_notification": true}' https://api.telegram.org/bot XX:YY/sendMessage
+
+    # curl -X GET -H 'Content-Type: application/json' https://api.telegram.org/XX:YY/getUpdates
+
+    RAW_MAX_SIZE = 3057
+
+    class Buffer
+      def initialize(chunk_size: RAW_MAX_SIZE, size: 10)
+        @buffer = ''
+        @chunk_size = chunk_size
+
+        @ready = SizedQueue.new(size)
+        @mx = Monitor.new
+        @cbs = []
+      end
+
+      def push(data, &cb)
+        chunks = []
+        @mx.synchronize do
+          @buffer += data
+          @cbs << cb
+
+          while @buffer.size >= @chunk_size
+            chunks << @buffer.slice!(0...@chunk_size) # ... -ТРИ ТОЧКИ НЕ ВКЛЮЧИТЕЛЬНО!
+            chunks.last.instance_variable_set('@_cbs', @cbs.slice!(0..-1))
+          end
+        end
+
+        chunks.each do |chunk|
+          @ready.push(chunk)
+        end
+      end
+
+      def pop(timeout: 1)
+        @mx.synchronize do
+          return @buffer.empty? ? nil : @buffer.slice!(0..-1) if @ready.empty?
+        end
+
+        @ready.pop(timeout: timeout)
+      end
+    end
+
     def initialize(itoken:, otoken:, channel:, logger: TgMq.config.logger)
       @logger = TgMq.setup_logger(logger).tagged(self.class)
 
@@ -15,6 +57,8 @@ module TgMq
       @itoken = itoken
       @otoken = otoken
       @channel = channel
+
+      @buffer = Buffer.new
 
       @output_bot = ::Telegram::Bot::Client.new(@otoken, timeout: 5)
       @output_shaper = OutputShaper.new(chunk_size: 4080)
@@ -34,7 +78,8 @@ module TgMq
       raise 'Unable to enqueue message: connection is stopped' if stopped?
 
       logger.debug("Enqueue message of #{data.size} bytes")
-      @output_shaper.enqueue_data(data, &cb)
+      @buffer.push(data, &cb)
+      # @output_shaper.enqueue_data(data, &cb)
     end
 
     def stopped?
@@ -98,6 +143,16 @@ module TgMq
         until @stopped
           break if @stopped
           next(sleep 1) if Time.now < next_send_at
+
+          chunk = @buffer.pop(timeout: 1)
+          break if @stopped
+          next(sleep 1) if chunk.nil?
+
+          @output_shaper.enqueue_data(chunk) do |*args|
+            (chunk.instance_variable_get('@_cbs') || []).each do |cb|
+              cb.call(*args)
+            end
+          end
 
           frame = c.deq(timeout: 1)
           break if @stopped

@@ -17,8 +17,18 @@ end
   itoken: nil,
   otoken: nil,
   channel: nil,
+  input:   '-',
+  output:  '-',
   log_level: ENV.fetch('LOG_LEVEL', ::Logger::INFO)
 }
+
+# tgmq --it XX1:YY1 --ot XX1:YY2 -c -1002782239054 -d
+# tgmq --ot XX1:YY1 --it XX1:YY2 -c -1002782239054 -d
+
+
+
+# tgmq --it XX1:YY1 --ot XX1:YY2 -c -1002782239054 -d -i 3333
+# tgmq --ot XX1:YY1 --it XX1:YY2 -c -1002782239054 -d -o 22
 
 parser = OptionParser.new do |o|
   o.banner = "Usage: #{UTIL} [options]"
@@ -34,19 +44,134 @@ parser = OptionParser.new do |o|
     @opts[:log_level] = ::Logger::WARN
   end
 
-  o.on('-i TOKEN', '--itoken TOKEN', String, 'Telegram Bot token for input channel') do |token|
+  o.on('--it TOKEN', '--itoken TOKEN', String, 'Telegram Bot token for input channel') do |token|
     @opts[:itoken] = token.strip
   end
 
-  o.on('-o TOKEN', '--otoken TOKEN', String, 'Telegram Bot token for output channel') do |token|
+  o.on('--ot TOKEN', '--otoken TOKEN', String, 'Telegram Bot token for output channel') do |token|
     @opts[:otoken] = token.strip
   end
 
   o.on('-c CHANNEL', '--channel CHANNEL', String, 'Telegram Bot chat_id to communicate through') do |channel|
     @opts[:channel] = channel
   end
+
+  o.on('-i INPUT', '--input INPUT', String, 'Input port. "-" for STDIN') do |input|
+    @opts[:input] = input
+  end
+
+  o.on('-o OUTPUT', '--output OUTPUT', String, 'Output port. "-" for OUTPUT') do |output|
+    @opts[:output] = output
+  end
 end
 @args = parser.parse!
+
+TgMq.config.logger.debug @opts 
+
+class Port
+end
+
+class TcpSrc < Port
+  def initialize(port)
+    super()
+    @port = port
+  end
+
+  def flush
+    @socket&.flush
+  end
+
+  def read
+    @server ||= TCPServer.new @port
+    @socket ||= begin 
+      a = @server.accept
+      TgMq.config.logger.debug "SRV accept"
+      a
+    end
+    TgMq.config.logger.debug "SRV read from: #{@socket}"
+    @socket.readpartial(3057)
+  end
+
+  def write data
+    @server ||= TCPServer.new @port
+    @socket ||= @server.accept
+    TgMq.config.logger.debug "SRV write to: #{@socket}"
+    @socket.write(data)
+    @socket.flush
+  end
+
+  def close
+    @socket&.flush
+    @socket&.close
+  end
+end
+
+class TcpDst < Port
+  def initialize(port)
+    super()
+    @port = port
+  end
+
+  def flush
+    @socket&.flush
+  end
+
+  def read
+    @socket ||= TCPSocket.new 'localhost', @port
+    @socket.readpartial(3057)
+  end
+
+  def write data
+    @socket ||= TCPSocket.new 'localhost', @port
+    @socket&.write(data)
+    @socket&.flush
+  end
+
+  def close
+    @socket&.flush
+    @socket&.close
+  end
+end
+
+class StdPort < Port
+  def initialize(stream)
+    super()
+    @stream = stream
+    @stream.binmode
+  end
+
+  def flush
+    @stream.flush
+  end
+
+  def read
+    @stream.readpartial(3057)
+  end
+
+  def write data
+    @stream.write(data)
+    @stream.flush
+  end
+
+  def close
+    @stream.flush
+    @stream.close
+  end
+end
+
+if @opts[:input] == '-' && @opts[:output] == '-'
+  #TgMq.config.logger.debug "STDIN/STDOUT"
+  $input = StdPort.new(STDIN)
+  $output = StdPort.new(STDOUT)
+elsif @opts[:input] != '-'
+  #TgMq.config.logger.debug "read #{@opts[:input].to_i}"
+  $input = TcpSrc.new(@opts[:input].to_i)
+  $output = $input
+elsif @opts[:input] == '-' && @opts[:output] != '-'
+  #TgMq.config.logger.debug "write #{@opts[:output].to_i}"
+  $output = TcpDst.new(@opts[:output].to_i)
+  $input = $output
+end
 
 TgMq.configure do |config|
   config.logger = ActiveSupport::TaggedLogging.new(::Logger.new(STDERR, formatter: Logger::Formatter.new))
@@ -62,8 +187,10 @@ def terminate_now(msq = 'Quitting')
 
   $terminate = true
   warn("#{msq} gracefully...")
-  STDOUT.flush
-  STDIN.close
+  #STDOUT.flush
+  #STDIN.close
+  $output.flush
+  $input.close
   $conn.stop
   $queue.push(:terminate)
 end
@@ -80,10 +207,13 @@ Signal.trap 'INT' do
   end
 end
 
+
+
 reader = Thread.new(control_queue) do |q, _c|
-  STDIN.binmode
+  #STDIN.binmode
   loop do
-    q.push([:in, STDIN.readpartial(3057)])
+    #q.push([:in, STDIN.readpartial(3057)])
+    q.push([:in, $input.read])
   rescue EOFError
     q.push([:in, 'EOF', proc { q.push(:terminate) }])
     break
@@ -93,7 +223,7 @@ rescue StandardError
 end
 
 remote = Thread.new(queue, conn) do |q, c|
-  STDOUT.binmode
+  #STDOUT.binmode
   c.subscribe! { |line| q.push([:out, line]) }
 end
 
@@ -112,8 +242,9 @@ loop do
     if data.strip == 'EOF'
       terminate_now
     else
-      STDOUT.write(data)
-      STDOUT.flush
+      #STDOUT.write(data)
+      #STDOUT.flush
+      $output.write(data)
     end
   end
 end

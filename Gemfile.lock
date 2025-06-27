@@ -1,7 +1,7 @@
 PATH
   remote: .
   specs:
-    tg_mq (0.0.3)
+    tg_mq (0.1.0)
       activesupport (~> 6.0)
       logger
       telegram-bot-ruby
