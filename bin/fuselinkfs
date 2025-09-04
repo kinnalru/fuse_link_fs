@@ -1,0 +1,187 @@
+#!/bin/env ruby
+
+require 'logger'
+require 'active_support/all'
+require 'ffi/libfuse'
+require 'fuse_link_fs'
+require 'socksify'
+
+UTIL = File.basename(__FILE__)
+SELF = File.absolute_path(__FILE__)
+
+Thread.abort_on_exception = true
+
+[STDIN, STDOUT, STDERR].each do |io|
+  io.sync = true
+rescue StandardError
+end
+
+class FuseLinkFs::Fs
+  include FFI::Libfuse::Adapter::Ruby
+  include FFI::Libfuse::Adapter::Fuse2Compat
+
+  # FUSE Configuration methods
+
+  def logger
+    FuseLinkFs.config.logger
+  end
+
+  def fuse_configure *_args, **_kwargs
+    if (addr = ENV.fetch('http_proxy', nil))
+      uri = URI(addr)
+      puts "USING PROXY: #{uri}"
+      TCPSocket.socks_server = uri.hostname
+      TCPSocket.socks_port = uri.port
+    end
+
+    ARGV.unshift '-unused' # надо чтоб распарсить mountpoint
+    @mountpoint = FFI::Libfuse::Main.fuse_parse_cmdline(args: ARGV, handler: nil)[:mountpoint]
+
+    @db_path = File.join(@mountpoint, '.fuselinks')
+    @db_file = File.open(@db_path, File::RDWR | File::CREAT)
+    @db = begin
+      JSON.parse(@db_file.read)
+    rescue StandardError
+      {}
+    end
+    @storage = FuseLinkFs::Storage.new(FuseLinkFs::Provider::LIST.map(&:new), cache: {})
+
+    FuseLinkFs.configure do |config|
+      config.logger = ActiveSupport::TaggedLogging.new(::Logger.new(STDERR, formatter: Logger::Formatter.new))
+      config.logger.level = ENV.fetch('LOG_LEVEL', :info)
+      config.logger.level = :debug if debug?
+    end
+  rescue StandardError => e
+    logger.error "fuse_configure exception: #{e}"
+    raise
+  end
+
+  # FUSE callbacks
+
+  def getattr(path, stat, *args)
+    logger.debug "[getattr] path=#{path} stat=#{stat.inspect} args=#{args}"
+
+    case path
+    when '/'
+      stat.directory(mode: 0o777)
+      nil
+    else
+      file = get_file(path)
+      raise Errno::ENOENT if file.nil?
+
+      return stat.file(mode: 0o744, size: 0) if file.empty?
+
+      stat.file(mode: file.fetch('perms', 0o744), size: file.fetch('size', file['content'].to_s.size))
+    end
+  rescue StandardError => e
+    logger.error "[getattr] exception: #{e}"
+    raise
+  end
+
+  def readdir(path, *args)
+    logger.debug "[readdir] path=#{path} args=#{args}"
+
+    @db.fetch('files', {}).each do |(p, _json)|
+      yield p[1..-1] # убираем лидирующий /
+    end
+  rescue StandardError => e
+    logger.error "[readdir] exception: #{e}"
+    raise
+  end
+
+  def open(path, *args)
+    logger.debug "[open] path=#{path} args=#{args}"
+  rescue StandardError => e
+    logger.error "[open] exception: #{e}"
+    raise
+  end
+
+  def release(path, *args, **kwargs)
+    logger.debug "[release] args=#{args} kwargs=#{kwargs}"
+    file = get_file(path)
+
+    if (content = file.fetch('content', nil))
+      link = @storage.store(content)
+      file['link'] = link
+      file['size'] = content.size
+      file.delete('content')
+    end
+  rescue StandardError => e
+    logger.error "[release] exception: #{e}"
+    raise
+  end
+
+  def write_buf(path, offset, _buffer, *args, &block)
+    logger.debug "[write_buf] path=#{path} offset=#{offset} args=#{args}"
+
+    data = block.call
+    file = get_file(path)
+    file['content'] ||= ''
+    file['content'] += data
+
+    data.size
+  rescue StandardError => e
+    logger.error "[write_buf] exception: #{e}"
+    raise
+  end
+
+  # Creates the File at {#map_path}(path)
+  def create(path, perms = 0o644, ffi = nil)
+    logger.debug "[create] path=#{path} perms=#{perms} ffi=#{ffi.inspect}"
+    put_file(path, { perms: perms })
+  rescue StandardError => e
+    puts "[create] exception: #{e}"
+    raise
+  end
+
+  def unlink(path)
+    logger.debug "[unlink] path=#{path}"
+    get_file!(path)
+
+    remove_file!(path)
+  end
+
+  def read(path, *args)
+    logger.debug "[read] path=#{path} args=#{args}"
+    file = get_file!(path)
+
+    if (link = file.fetch('link', link))
+      FuseLinkFs::Provider.dec(@storage.extract(link))
+    else
+      file.fetch('content')
+    end
+  rescue StandardError => e
+    logger.debug "[read] exception: #{e}"
+    raise
+  end
+
+  def destroy *args, **kwargs
+    logger.debug "[destroy] args=#{args} kwargs=#{kwargs}"
+    @db_file.rewind
+    @db_file.write(@db.to_json)
+    @db_file.close
+  end
+
+  def get_file(path)
+    @db.fetch('files', {}).fetch(path, nil)
+  end
+
+  def get_file!(path)
+    get_file(path).tap do |file|
+      raise Errno::ENOENT if file.nil?
+    end
+  end
+
+  def put_file(path, json)
+    @db['files'] ||= {}
+    @db['files'][path] = json
+  end
+
+  def remove_file!(path)
+    @db['files'].delete(path)
+  end
+end
+
+exit(FFI::Libfuse.fuse_main(operations: FuseLinkFs::Fs.new)) if __FILE__ == $0
+
+exit(0)

@@ -4,14 +4,14 @@ require 'active_support/all'
 require 'zeitwerk'
 
 loader = Zeitwerk::Loader.for_gem
-loader.ignore("#{__dir__}/tg-mq.rb")
+loader.ignore("#{__dir__}/fuse-link-fs.rb")
 loader.inflector.inflect(
-  'tg_mq' => 'TgMq',
-  'tg-mq' => 'TgMq'
+  'fuse_link_fs' => 'FuseLinkFs',
+  'fuse-link-fs' => 'FuseLinkFs'
 )
 loader.setup
 
-module TgMq
+module FuseLinkFs
   include Configuration::Concern
 
   def self.setup_logger(logger)

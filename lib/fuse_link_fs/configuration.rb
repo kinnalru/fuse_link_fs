@@ -1,6 +1,6 @@
 require 'uri'
 
-module TgMq
+module FuseLinkFs
   class Configuration
     attr_accessor :logger
 
@@ -20,7 +20,7 @@ module TgMq
         # has attribute readers so that we can access
         # the configured values
         def configuration
-          @configuration ||= TgMq::Configuration.new
+          @configuration ||= FuseLinkFs::Configuration.new
         end
 
         def config
